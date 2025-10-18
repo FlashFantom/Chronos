@@ -1,0 +1,949 @@
+from nicegui import ui, app, Client, run
+import datetime
+import time
+import requests
+from typing import Optional
+from fastapi import Request, Response, Query
+from nicegui.events import KeyEventArguments
+from fastapi.responses import RedirectResponse, JSONResponse
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from transliterate import translit
+from database import Pool
+import sqlite3
+
+tokens = ["dehd7ehfdjnal"]
+bitrix_webhook = "https://acrm.site/rest/3183/vicx3eyi3xa9w2qi/imbot.message.add.json?BOT_ID=2189&CLIENT_ID=tt91k10dv1dcx8by7wtse0gujljuegus&"
+bitrix_chat_hr = "chat1433845"
+bitrix_hr_user_id = "1885"
+bitrix_hr_auditors = ["1831"]
+
+pool = Pool()
+
+
+class User(BaseModel):
+    name: str
+    login: str
+    password: str
+    isAdmin: bool
+
+
+unrestricted_page_routes = {"/login"}
+has_task = False
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not app.storage.user.get("authenticated", False):
+            if (
+                request.url.path in Client.page_routes.values()
+                and request.url.path not in unrestricted_page_routes
+            ):
+                app.storage.user["referrer_path"] = request.url.path
+                return RedirectResponse("/login")
+        if request.url.path == "/admin" and app.storage.user["isAdmin"] != "True":
+            print("Admin request from "+app.storage.user.get("name", None))
+            return RedirectResponse("/")
+        return await call_next(request)
+
+
+def get_table_name(name: str):
+    name = translit(name, "ru", True).lower()
+    name = "".join([c if c.isalpha() else "_" for c in name]).strip("_")
+    return name
+
+
+app.add_middleware(AuthMiddleware)
+
+
+@ui.page("/", response_timeout=30)
+async def index(client: Client, request: Request):
+    try:
+        await client.connected(timeout=30)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    is_first_time: bool = app.storage.user.get("firstTime", True)
+    has_reported: bool = app.storage.user.get("hasReported", False)
+    has_reported_overtime: bool = app.storage.user.get("hasReportedOvertime", False)
+    is_busy: bool = app.storage.user.get("isBusy", False)
+    print(request.headers)
+
+    def show_help():
+        with ui.dialog() as welcome, ui.card():
+            ui.label("Добро пожаловать!").classes("text-h4")
+            # ui.label('''Вы пытаетесь завершить рабочий день раньше 18:00. Будут последствия (ваш кофе станет без кофеина, интернет будет работать только на скорости диал-апа, ваш кот начнет учить французский, ваш холодильник станет певчим хором, а ваша кофейная чашка начнет рассказывать вам анекдоты на китайском диалекте)''')
+            ui.label(
+                """Это приложение для учета времени. Когда приходите утром ставите статус "На рабочем месте". Когда отходите от рабочего места по любым вопросам, не связанным с рабочим процессом, ставите статус "Перерыв", по возвращении ставите "На рабочем месте". В случае, когда отходите по рабочим вопросам или попить водички (макс. 1 минута) оставляете "На рабочем месте". И всегда, когда вас нет на рабочем месте эта табличка должна быть открыта. В конце рабочего дня ставите "Конец дня"."""
+            )
+            ui.label("Краткая подсказка по горячим клавишам:")
+            ui.label('  - 🡄 : статус "На рабочем месте"')
+            ui.label('  - 🡆 : статус "Перерыв"')
+            ui.label("  - q, l: завершить рабочий день")
+            ui.label("  - /, h: показать эту подсказку")
+            ui.button("OK", on_click=lambda: welcome.close())
+        welcome.open()
+
+    if is_first_time:
+        show_help()
+        app.storage.user["firstTime"] = False
+
+    print(str(client.ip) + " " + app.storage.user.get("name", None))
+    mname: str = app.storage.user.get("name", None)
+    if mname:
+        english_name = get_table_name(mname)
+    else:
+        return "Name not provided!"
+    
+    # print(pool.fetch_busy(mname))
+    touch = await ui.run_javascript(
+        """document.querySelector('div').addEventListener('touchstart', function(event) {
+    event.preventDefault();
+  });
+    return True""", timeout=5.0)
+
+    try:
+        state = app.storage.user["state"]
+    except KeyError:
+        app.storage.user["state"] = None
+        state = None
+    try:
+        cdate = app.storage.user["date"]
+    except KeyError:
+        app.storage.user["date"] = str(datetime.date.today())
+    cdate = app.storage.user["date"]
+    if cdate != str(datetime.date.today()):
+        app.storage.user["state"] = None
+        app.storage.user["hasReported"] = False
+        app.storage.user["hasLeft"] = False
+        app.storage.user["hasReportedOvertime"] = False
+        state = None
+        ui.notify("Доброе утро!", type="info")
+        app.storage.user["date"] = str(datetime.date.today())
+
+    states = ["На рабочем месте", "Перерыв"]
+    firstName = mname.split(" ")[1]
+    has_left: bool = app.storage.user.get("hasLeft", False)
+    is_busy = app.storage.user.get("isBusy", False)
+    # print(is_busy)
+    print(request.session["id"] + " " + mname)
+
+    def updateInfo():
+        if startTime.text == "":
+            try:
+                startTime.text = str(pool.fetch_start_time(english_name))[0:-3]
+                if (
+                    datetime.time(
+                        int(startTime.text.split(":")[0]),
+                        int(startTime.text.split(":")[1]),
+                    )
+                    > datetime.time(9, 1)
+                ) and not has_reported:
+                    req2 = requests.get(
+                        f"{bitrix_webhook}DIALOG_ID={bitrix_chat_hr}&MESSAGE=Опоздание: {mname} | {startTime.text}"
+                    )
+                    app.storage.user["hasReported"] = True
+
+            except TypeError:
+                print()
+        rec_time.text = pool.fetch_out_duration(english_name)
+        if (pool.fetch_out_duration_seconds(get_table_name(mname)) > 3600) and (
+            not app.storage.user.get("hasReportedOvertime",False)
+        ):
+            req = requests.get(
+                f"{bitrix_webhook}DIALOG_ID={bitrix_chat_hr}&MESSAGE=Превышение лимита: {mname} | {rec_time.text}"
+            )
+            app.storage.user["hasReportedOvertime"] = True
+
+    async def handle_key(e: KeyEventArguments):
+        print(mname + " " + e.key.code)
+        if not e.action.keyup and toggle1.enabled:
+            if e.key.arrow_left:
+                toggle1.set_value(states[0])
+                # ui.notify(states[0])
+            elif e.key.arrow_right:
+                toggle1.set_value(states[1])
+                toggle1.props(add="toggle-color=red")
+                # ui.notify(states[2])
+            elif e.key.code == "KeyL" or e.key.code == "KeyQ":
+                await handle_leave()
+            elif e.key.code == "Slash" or e.key.code == "KeyH":
+                show_help()
+
+
+
+    clocktimer = ui.timer(0.5, None, active=False)
+
+    audio = ui.audio(src="breaktime.ogg", controls=False)
+    # def alert():
+    #     audio.play()
+
+    # alert_timer = ui.timer(60,alert, active=False)
+    # if app.storage.user["state"] == "Перерыв":
+    #     alert_timer.activate()
+
+    def timer_callback(now):
+        remaining_time = datetime.datetime.now() - now + datetime.timedelta(seconds=1)
+        timer.set_text(f"{remaining_time}"[2:-7])
+
+    def change_state():
+
+        if app.storage.user["state"] != toggle1.value:
+            now = datetime.datetime.now()
+            with open("logs.txt", "a") as f:
+                f.write("%s %s %s\n" % (now.isoformat(), mname, toggle1.value))
+            ui.notify(toggle1.value, type="positive")
+            # check = datetime.time(8,55)
+            # if (check>now.time()):
+            #     ui.notify('Вы не можете отметиться до 08:55', type="negative")
+            #     toggle1.value = None
+            #     app.storage.user["state"] = None
+            #     toggle1.props(remove="toggle-color")
+            #     return
+            toggle1.disable()
+            app.storage.user["state"] = toggle1.value
+            if toggle1.value == "Перерыв":
+                toggle1.props(add="toggle-color=red")
+                ui.query("body").style(
+                    add="border-right: 5vw solid red;border-left: 5vw solid red;"
+                )
+                if pool.fetch_out_duration_seconds(get_table_name(mname)) > 3600:
+                    req = requests.get(
+                        f'{bitrix_webhook}DIALOG_ID={bitrix_chat_hr}&MESSAGE=:!: "Перерыв" с превышением лимита: {mname} | {rec_time.text}'
+                    )
+                clocktimer.callback = lambda: timer_callback(now)
+                # alert_timer.activate()
+                clocktimer.activate()
+                timer.visible = True
+            else:
+                toggle1.props(remove="toggle-color")
+                ui.query("body").style(
+                    remove="border-right: 10vw solid red;border-left: 10vw solid red;"
+                )
+                clocktimer.deactivate()
+                # alert_timer.deactivate()
+                clocktimer.callback = None
+                timer.visible = None
+                timer.text = "00:00"
+            pool.insert_data(english_name, now.isoformat(), toggle1.value)
+            updateInfo()
+            toggle1.enable()
+    
+    def set_busy_status(status: bool):
+        app.storage.user["isBusy"] = status
+        busy_checkbox.checked = status
+        pool.insert_busy(mname, status)
+        if status:
+            busy_checkbox.props(add="color=red")
+            ui.query("body").style(
+                    add="border-right: 5vw solid red;border-left: 5vw solid red;"
+                )
+            ui.notify("Теперь вы заняты!", type="warning")
+        else:
+            busy_checkbox.props(add="color=primary")
+            ui.query("body").style(
+                    remove="border-right: 5vw solid red;border-left: 5vw solid red;"
+                )
+            ui.notify("Теперь вы свободны!", type="positive")
+
+        
+
+    tux = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--!Font Awesome Free 6.5.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free Copyright 2024 Fonticons, Inc.--><path d="M220.8 123.3c1 .5 1.8 1.7 3 1.7 1.1 0 2.8-.4 2.9-1.5 .2-1.4-1.9-2.3-3.2-2.9-1.7-.7-3.9-1-5.5-.1-.4 .2-.8 .7-.6 1.1 .3 1.3 2.3 1.1 3.4 1.7zm-21.9 1.7c1.2 0 2-1.2 3-1.7 1.1-.6 3.1-.4 3.5-1.6 .2-.4-.2-.9-.6-1.1-1.6-.9-3.8-.6-5.5 .1-1.3 .6-3.4 1.5-3.2 2.9 .1 1 1.8 1.5 2.8 1.4zM420 403.8c-3.6-4-5.3-11.6-7.2-19.7-1.8-8.1-3.9-16.8-10.5-22.4-1.3-1.1-2.6-2.1-4-2.9-1.3-.8-2.7-1.5-4.1-2 9.2-27.3 5.6-54.5-3.7-79.1-11.4-30.1-31.3-56.4-46.5-74.4-17.1-21.5-33.7-41.9-33.4-72C311.1 85.4 315.7 .1 234.8 0 132.4-.2 158 103.4 156.9 135.2c-1.7 23.4-6.4 41.8-22.5 64.7-18.9 22.5-45.5 58.8-58.1 96.7-6 17.9-8.8 36.1-6.2 53.3-6.5 5.8-11.4 14.7-16.6 20.2-4.2 4.3-10.3 5.9-17 8.3s-14 6-18.5 14.5c-2.1 3.9-2.8 8.1-2.8 12.4 0 3.9 .6 7.9 1.2 11.8 1.2 8.1 2.5 15.7 .8 20.8-5.2 14.4-5.9 24.4-2.2 31.7 3.8 7.3 11.4 10.5 20.1 12.3 17.3 3.6 40.8 2.7 59.3 12.5 19.8 10.4 39.9 14.1 55.9 10.4 11.6-2.6 21.1-9.6 25.9-20.2 12.5-.1 26.3-5.4 48.3-6.6 14.9-1.2 33.6 5.3 55.1 4.1 .6 2.3 1.4 4.6 2.5 6.7v.1c8.3 16.7 23.8 24.3 40.3 23 16.6-1.3 34.1-11 48.3-27.9 13.6-16.4 36-23.2 50.9-32.2 7.4-4.5 13.4-10.1 13.9-18.3 .4-8.2-4.4-17.3-15.5-29.7zM223.7 87.3c9.8-22.2 34.2-21.8 44-.4 6.5 14.2 3.6 30.9-4.3 40.4-1.6-.8-5.9-2.6-12.6-4.9 1.1-1.2 3.1-2.7 3.9-4.6 4.8-11.8-.2-27-9.1-27.3-7.3-.5-13.9 10.8-11.8 23-4.1-2-9.4-3.5-13-4.4-1-6.9-.3-14.6 2.9-21.8zM183 75.8c10.1 0 20.8 14.2 19.1 33.5-3.5 1-7.1 2.5-10.2 4.6 1.2-8.9-3.3-20.1-9.6-19.6-8.4 .7-9.8 21.2-1.8 28.1 1 .8 1.9-.2-5.9 5.5-15.6-14.6-10.5-52.1 8.4-52.1zm-13.6 60.7c6.2-4.6 13.6-10 14.1-10.5 4.7-4.4 13.5-14.2 27.9-14.2 7.1 0 15.6 2.3 25.9 8.9 6.3 4.1 11.3 4.4 22.6 9.3 8.4 3.5 13.7 9.7 10.5 18.2-2.6 7.1-11 14.4-22.7 18.1-11.1 3.6-19.8 16-38.2 14.9-3.9-.2-7-1-9.6-2.1-8-3.5-12.2-10.4-20-15-8.6-4.8-13.2-10.4-14.7-15.3-1.4-4.9 0-9 4.2-12.3zm3.3 334c-2.7 35.1-43.9 34.4-75.3 18-29.9-15.8-68.6-6.5-76.5-21.9-2.4-4.7-2.4-12.7 2.6-26.4v-.2c2.4-7.6 .6-16-.6-23.9-1.2-7.8-1.8-15 .9-20 3.5-6.7 8.5-9.1 14.8-11.3 10.3-3.7 11.8-3.4 19.6-9.9 5.5-5.7 9.5-12.9 14.3-18 5.1-5.5 10-8.1 17.7-6.9 8.1 1.2 15.1 6.8 21.9 16l19.6 35.6c9.5 19.9 43.1 48.4 41 68.9zm-1.4-25.9c-4.1-6.6-9.6-13.6-14.4-19.6 7.1 0 14.2-2.2 16.7-8.9 2.3-6.2 0-14.9-7.4-24.9-13.5-18.2-38.3-32.5-38.3-32.5-13.5-8.4-21.1-18.7-24.6-29.9s-3-23.3-.3-35.2c5.2-22.9 18.6-45.2 27.2-59.2 2.3-1.7 .8 3.2-8.7 20.8-8.5 16.1-24.4 53.3-2.6 82.4 .6-20.7 5.5-41.8 13.8-61.5 12-27.4 37.3-74.9 39.3-112.7 1.1 .8 4.6 3.2 6.2 4.1 4.6 2.7 8.1 6.7 12.6 10.3 12.4 10 28.5 9.2 42.4 1.2 6.2-3.5 11.2-7.5 15.9-9 9.9-3.1 17.8-8.6 22.3-15 7.7 30.4 25.7 74.3 37.2 95.7 6.1 11.4 18.3 35.5 23.6 64.6 3.3-.1 7 .4 10.9 1.4 13.8-35.7-11.7-74.2-23.3-84.9-4.7-4.6-4.9-6.6-2.6-6.5 12.6 11.2 29.2 33.7 35.2 59 2.8 11.6 3.3 23.7 .4 35.7 16.4 6.8 35.9 17.9 30.7 34.8-2.2-.1-3.2 0-4.2 0 3.2-10.1-3.9-17.6-22.8-26.1-19.6-8.6-36-8.6-38.3 12.5-12.1 4.2-18.3 14.7-21.4 27.3-2.8 11.2-3.6 24.7-4.4 39.9-.5 7.7-3.6 18-6.8 29-32.1 22.9-76.7 32.9-114.3 7.2zm257.4-11.5c-.9 16.8-41.2 19.9-63.2 46.5-13.2 15.7-29.4 24.4-43.6 25.5s-26.5-4.8-33.7-19.3c-4.7-11.1-2.4-23.1 1.1-36.3 3.7-14.2 9.2-28.8 9.9-40.6 .8-15.2 1.7-28.5 4.2-38.7 2.6-10.3 6.6-17.2 13.7-21.1 .3-.2 .7-.3 1-.5 .8 13.2 7.3 26.6 18.8 29.5 12.6 3.3 30.7-7.5 38.4-16.3 9-.3 15.7-.9 22.6 5.1 9.9 8.5 7.1 30.3 17.1 41.6 10.6 11.6 14 19.5 13.7 24.6zM173.3 148.7c2 1.9 4.7 4.5 8 7.1 6.6 5.2 15.8 10.6 27.3 10.6 11.6 0 22.5-5.9 31.8-10.8 4.9-2.6 10.9-7 14.8-10.4s5.9-6.3 3.1-6.6-2.6 2.6-6 5.1c-4.4 3.2-9.7 7.4-13.9 9.8-7.4 4.2-19.5 10.2-29.9 10.2s-18.7-4.8-24.9-9.7c-3.1-2.5-5.7-5-7.7-6.9-1.5-1.4-1.9-4.6-4.3-4.9-1.4-.1-1.8 3.7 1.7 6.5z"/></svg>"""
+    welcome = (
+        ui.label()
+        .classes("text-center q-mt-xl font-normal antialiased fixed-top")
+        .style("font-size:4vw")
+    )
+    if has_left:
+        welcome.set_text(f"😴 Приятного отдыха! 👋")
+    else:
+        welcome.set_text(f"Привет, {firstName}!")
+    if request.headers["user-agent"].lower().find("linux") != -1:
+        ui.html(tux).style("width:3vw;height:3vw;user-select:none").classes(
+            "no-select absolute-bottom-right animate-pulse hover:animate-bounce absolute bottom-5 right-5"
+        ).props('draggable v-touch-pan.prevent.mouse="moveFab"')
+    today_1 = datetime.date.today()
+
+    if today_1.month == 4 and today_1.day == 1:
+        print("April Fools!")
+        ui.add_head_html(
+            """
+            <style>
+            body {
+                transform: rotate(180deg);
+            }
+        </style>
+        """
+        )
+
+    seasonal_image = ""
+    tooltip = ""
+    month = datetime.datetime.now().month
+    if datetime.datetime.now().day == 22 and month == 4:
+        seasonal_image = "https://i.imgur.com/HsZmH4M.png"
+        tooltip = "День Земли " + str(datetime.datetime.now().year) + "!"
+    elif month == 12 and datetime.datetime.now().day > 25:
+        seasonal_image = "https://i.imgur.com/nvdqSps.png"
+    elif month in [12, 1, 2]:
+        seasonal_image = "https://i.imgur.com/MiHFR8t.png"
+    elif month in [3, 4, 5]:
+        seasonal_image = "https://clipart-library.com/img1/934447.png"
+    elif month in [6, 7, 8]:
+        seasonal_image = "https://i.imgur.com/xTE9Rdz.png"
+    elif month in [9, 10, 11]:
+        seasonal_image = "https://i.imgur.com/3uTQZz0.png"
+
+    seasonal = (
+        ui.image(seasonal_image)
+        .style("width:5vw;height:5vw;user-select:none;")
+        .classes("no-select absolute-bottom-left hover:animate-spin bottom-5 left-5")
+    )
+    if (tooltip):
+        seasonal.tooltip(tooltip)
+
+    with ui.column().classes(
+        "full-height column no-wrap justify-center items-center content-center absolute-center"
+    ):
+        with ui.row():
+            toggle1 = ui.toggle(states, value=state, on_change=change_state).props(
+                "rounded ripple size=3vw spread no-caps push"
+            )
+            if toggle1.value == "Перерыв":
+                toggle1.props(add="toggle-color=red")
+                # alert_timer.activate()
+                ui.query("body").style(
+                    add="border-right: 5vw solid red;border-left: 5vw solid red;"
+                )
+            
+
+        with ui.row().classes("justify-center items-center content-center"):
+            startTime = (
+                ui.button("", icon="r_flag", on_click=updateInfo)
+                .tooltip("Начало дня")
+                .props("rounded ripple=false size=2rem outline")
+            )
+            rec_time = (
+                ui.button("", icon="r_more_time", on_click=updateInfo)
+                .tooltip("Оставшееся время")
+                .props("rounded ripple=false size=2rem outline")
+            )
+            timer = (
+                ui.button("00:00", icon="r_timelapse")
+                .tooltip("Таймер")
+                .props("rounded ripple=false size=2rem outline")
+            )
+            
+            timer.visible = False
+            # busy_checkbox = ui.checkbox(value=is_busy, on_change=lambda: set_busy_status(busy_checkbox.value)).props(
+            #     "checked-icon=event_busy unchecked-icon=event_available keep-color size=7vw color=primary"
+            # )
+            # if busy_checkbox.value:
+            #     busy_checkbox.props(add="color=red")
+            # else:
+            #     busy_checkbox.props(add="color=primary")
+        # with ui.column():
+        #     ui.textarea(placeholder='Для важного и не очень.').bind_value(app.storage.user,'note').style('width:50vw;margin-top:1rem').props('rounded outlined clearable')
+        updateInfo()
+
+    async def handle_leave():
+        now = datetime.datetime.now()
+        check = datetime.time(18, 00)
+        if now.time() < check:
+            with ui.dialog() as dialog, ui.card():
+                ui.label("Ну, погоди, еще не вечер!").classes("text-h5")
+                # ui.label('''Вы пытаетесь завершить рабочий день раньше 18:00. Будут последствия (ваш кофе станет без кофеина, интернет будет работать только на скорости диал-апа, ваш кот начнет учить французский, ваш холодильник станет певчим хором, а ваша кофейная чашка начнет рассказывать вам анекдоты на китайском диалекте)''')
+                ui.label(
+                    """Вы пытаетесь завершить рабочий день раньше 18:00. Вы точно уверены?"""
+                )
+                with ui.row():
+                    ui.button("Да", on_click=lambda: dialog.submit("Yes"))
+                    ui.button("Нет", on_click=lambda: dialog.submit("No"))
+                result = await dialog
+                if result != "Yes":
+                    return
+        pool.insert_leave(mname, now.isoformat())
+        app.storage.user["state"] = None
+        app.storage.user["hasLeft"] = True
+        toggle1.value = None
+        toggle1.disable()
+        leave.disable()
+        welcome.set_text(f"😴 Приятного отдыха! 👋")
+        ui.notify("Пока-пока!", type="positive")
+
+    leave = (
+        ui.button("Конец дня", icon="r_door_back", on_click=handle_leave, color="red")
+        .props("rounded size=1.5rem outline")
+        .classes("absolute-top-right")
+        .style("margin:1rem")
+    )
+    if has_left:
+        leave.disable()
+        toggle1.disable()
+    else:
+        leave.enable()
+        toggle1.enable()
+    if app.storage.user["isAdmin"] == "True":
+        admin_button = (
+            ui.button(
+                "",
+                icon="r_manage_accounts",
+                on_click=lambda: ui.open("/admin", new_tab=True),
+            )
+            .props("rounded size=1.5rem outline")
+            .classes("absolute-top-left")
+            .style("margin:1rem")
+        )
+
+        # ui.button('Test', on_click=updateInfo).props('size=2rem')
+    # app.on_startup(lambda: run.io_bound(updateInfo))
+    # await run.io_bound(updateInfo)
+
+    keyboard = ui.keyboard(
+        on_key=handle_key,
+        repeating=False,
+        ignore=["input", "select", "button", "textarea", "editor"],
+    )
+
+
+@ui.page("/login", response_timeout=30)
+async def login(request: Request) -> Optional[RedirectResponse]:
+    def try_login() -> None:
+        if request.headers["user-agent"].lower().find("mobile") != -1:
+            ui.notify(
+                "Нельзя войти с мобильного устройства!",
+                type="negative",
+            )
+            return
+
+        with open("userdata.txt", "r") as f:
+            for line in f:
+                user_data = line.split("!!!")
+                # print(username.value + " " + password.value)
+                # print(user_data[2].strip() == password.value)
+                if (user_data[1] == username.value) and (
+                    user_data[2].strip() == password.value
+                ):
+                    app.storage.user.update(
+                        {
+                            "name": user_data[0],
+                            "authenticated": True,
+                            "isAdmin": user_data[4].strip(),
+                        }
+                    )
+                    ui.notify("Успех!", type="positive")
+                    ui.open(app.storage.user.get("referrer_path", "/"))
+        if not app.storage.user.get("authenticated", False):
+            ui.notify("Неправильный логин или пароль :(", color="negative")
+
+    if app.storage.user.get("authenticated", False):
+        return RedirectResponse("/")
+    with ui.card().classes("absolute-center"):
+        username = ui.input("Username").on("keydown.enter", try_login)
+        password = ui.input("Password", password=True, password_toggle_button=True).on(
+            "keydown.enter", try_login
+        )
+        ui.button("Log in", on_click=try_login)
+    return None
+
+
+@ui.page("/admin", title="AIVA[Chronos][Admin]", response_timeout=30)
+async def admin_panel(request: Request) -> Optional[RedirectResponse]:
+    if not app.storage.user["isAdmin"]:
+        return ui.open("/")
+    months = {
+        1: "Январь",
+        2: "Февраль",
+        3: "Март",
+        4: "Апрель",
+        5: "Май",
+        6: "Июнь",
+        7: "Июль",
+        8: "Август",
+        9: "Сентябрь",
+        10: "Октябрь",
+        11: "Ноябрь",
+        12: "Декабрь",
+    }
+    years = [2024, 2025, 2026, 2027, 2028, 2029, 2030]
+    managers = {}
+    with open("userdata.txt", "r") as f:
+        for line in f:
+            managers[line.split("!!!")[3]] = line.split("!!!")[0]
+
+    def updateInfo(name: str):
+        if name:
+            english_name = get_table_name(name)
+            try:
+                startTime.text = str(pool.fetch_start_time(english_name))[0:-3]
+            except TypeError:
+                startTime.text = "N/A"
+            except sqlite3.OperationalError:
+                ui.notify(f"Менеджер {name} не найден :(", type="warning")
+            rec_time.text = pool.fetch_out_duration(english_name)
+            state.text = pool.fetch_state(english_name, name)
+        else:
+            ui.notify("Менеджер не найден :(", type="warning")
+
+    def update_log(name: str):
+        if name:
+            english_name = get_table_name(name)
+            try:
+                data = pool.get_logs(english_name)
+                logs.clear()
+                for (time, state) in data:
+                    logs.push(
+                        str(datetime.datetime.fromisoformat(time))[:-7] + " " + state
+                    )
+
+            except sqlite3.OperationalError:
+                ui.notify(f"Менеджер {name} не найден :(", type="warning")
+        
+    def change_state_to_break(name: str):
+        if name:
+            english_name = get_table_name(name)
+            try:
+                pool.insert_data(english_name, datetime.datetime.now().isoformat(), "Перерыв")
+                updateInfo(name)
+            except sqlite3.OperationalError:
+                ui.notify(f"Менеджер {name} не найден :(", type="warning")
+    
+    def change_state_to_work(name: str):
+        if name:
+            english_name = get_table_name(name)
+            try:
+                pool.insert_data(english_name, datetime.datetime.now().isoformat(), "На рабочем месте")
+                updateInfo(name)
+            except sqlite3.OperationalError:
+                ui.notify(f"Менеджер {name} не найден :(", type="warning")
+
+    with ui.splitter(horizontal=True, value=30).style(
+        "width:80vw; height:100vh"
+    ).classes("absolute-center") as splitter1:
+        with splitter1.before:
+            with ui.column().classes(
+                "justify-center items-center content-center absolute-center"
+            ):
+                with ui.row():
+                    with ui.column().classes("justify-center content-center"):
+                        manager_input = (
+                            ui.input(
+                                "Имя менеджера", autocomplete=list(managers.values())
+                            )
+                            .props("rounded outlined")
+                            .on(
+                                "keydown.enter", lambda: updateInfo(manager_input.value)
+                            )
+                            .style("width:20rem")
+                        )
+
+                    ui.button(
+                        "Показать", on_click=lambda: updateInfo(manager_input.value)
+                    ).props("rounded")
+                    ui.button(
+                        "Логи", on_click=lambda: update_log(manager_input.value)
+                    ).props("rounded")
+                    
+                with ui.row().classes("justify-center items-center content-center"):
+                    startTime = (
+                        ui.button("", icon="r_flag")
+                        .tooltip("Начало дня")
+                        .props("rounded ripple=false size=2rem outline")
+                    )
+                    rec_time = (
+                        ui.button("", icon="r_more_time")
+                        .tooltip("Оставшееся время")
+                        .props("rounded ripple=false size=2rem outline")
+                    )
+                    state = (
+                        ui.button("", icon="r_toggle_on")
+                        .tooltip("Текущий статус")
+                        .props("rounded ripple=false size=2rem outline")
+                    )
+                with ui.row().classes("justify-center items-center content-center"):
+                    ui.button(
+                        "Поставить На рабочем месте", on_click=lambda: change_state_to_work(manager_input.value)
+                    ).props("rounded")
+                    ui.button(
+                        "Поставить Перерыв", on_click=lambda: change_state_to_break(manager_input.value)   
+                    ).props("rounded")
+                    
+                logs = ui.log().classes("w-full min-h-full")
+
+                def update_checkins(table_raw, columns_all):
+                    result = []
+                    for day, managers_d in table_raw.items():
+                        for manager, timestamp in managers_d.items():
+                            time = timestamp.split("T")[1].split(".")[0]
+                            if managers[manager] not in [d["manager"] for d in result]:
+                                if managers[manager]:
+                                    result.append({"manager": managers[manager]})
+                            for entry in result:
+                                if entry["manager"] == managers[manager]:
+                                    entry[day] = time
+                                    break
+                    dashboard.columns = columns_all
+                    dashboard.rows = result
+
+        def remember_tab():
+            app.storage.user["admin_tab"] = tab_panels.value
+
+        tab = app.storage.user.get("admin_tab", "checkins")
+
+        with splitter1.after:
+            with ui.row():
+                month_select = (
+                    ui.select(
+                        months,
+                        value=datetime.datetime.now().month,
+                        on_change=lambda: update_all(),
+                    )
+                    .props("rounded outlined")
+                    .style("margin-top:10px")
+                )
+                year_select = (
+                    ui.select(
+                        years,
+                        value=datetime.datetime.now().year,
+                        on_change=lambda: update_all(),
+                    )
+                    .props("rounded outlined")
+                    .style("margin-top:10px")
+                )
+            with ui.splitter(value=15).classes("w-full") as splitter:
+                with splitter.before:
+                    with ui.tabs().props(
+                        'narrow-indicator vertical active-color=black indicator-color="transparent"'
+                    ).on("update:model-value", remember_tab).classes(
+                        "text-grey-5"
+                    ) as tabs:
+                        checkins = ui.tab("checkins", "Начало дня")
+                        checkouts = ui.tab("checkouts", "Перерывы")
+                        states = ui.tab("states", "Текущий статус")
+                        leaves = ui.tab("leaves", "Уходы")
+                        manage_busy = ui.tab("manage_busy", "Управление занятостью")
+
+                with splitter.after:
+                    with ui.tab_panels(tabs, value=tab).props("vertical").classes(
+                        "w-full"
+                    ) as tab_panels:
+                        with ui.tab_panel(checkins):
+                            dashboard = ui.table(
+                                columns=[], row_key="manager", rows=[], pagination=10
+                            )
+                            with dashboard.add_slot("top-left"):
+
+                                def toggle() -> None:
+                                    dashboard.toggle_fullscreen()
+                                    dashboard_button.props(
+                                        "icon=r_fullscreen_exit"
+                                        if dashboard.is_fullscreen
+                                        else "icon=r_fullscreen"
+                                    )
+
+                                dashboard_button = ui.button(
+                                    "На весь экран",
+                                    icon="r_fullscreen",
+                                    on_click=toggle,
+                                ).props("flat")
+                        with ui.tab_panel(checkouts):
+                            time_dash = ui.table(
+                                columns=[], row_key="manager", rows=[], pagination=10
+                            )
+                            with time_dash.add_slot("top-left"):
+
+                                def toggle() -> None:
+                                    time_dash.toggle_fullscreen()
+                                    button1.props(
+                                        "icon=r_fullscreen_exit"
+                                        if time_dash.is_fullscreen
+                                        else "icon=r_fullscreen"
+                                    )
+
+                                button1 = ui.button(
+                                    "На весь экран",
+                                    icon="r_fullscreen",
+                                    on_click=toggle,
+                                ).props("flat")
+                        with ui.tab_panel(states):
+                            current_state_table = ui.table(
+                                columns=[
+                                    {
+                                        "name": "manager",
+                                        "label": "Сотрудник",
+                                        "field": "manager",
+                                        "required": True,
+                                        "align": "left",
+                                        "sortable": True,
+                                    },
+                                    {
+                                        "name": "state",
+                                        "label": "Статус",
+                                        "field": "state",
+                                        "sortable": True,
+                                    },
+                                    {
+                                        "name": "time",
+                                        "label": "Перерывы",
+                                        "field": "time",
+                                        "sortable": True,
+                                    },
+                                ],
+                                row_key="manager",
+                                rows=[],
+                                pagination=10,
+                            )
+                        with ui.tab_panel(leaves):
+                            leaves_table = ui.table(
+                                columns=[], row_key="manager", rows=[], pagination=10
+                            )
+                            with leaves_table.add_slot("top-left"):
+
+                                def toggle() -> None:
+                                    leaves_table.toggle_fullscreen()
+                                    button2.props(
+                                        "icon=r_fullscreen_exit"
+                                        if leaves_table.is_fullscreen
+                                        else "icon=r_fullscreen"
+                                    )
+
+                                button2 = ui.button(
+                                    "На весь экран",
+                                    icon="r_fullscreen",
+                                    on_click=toggle,
+                                ).props("flat")
+                        with ui.tab_panel(manage_busy):
+                            with ui.column():
+                                for manager in managers.items():
+                                    state = pool.fetch_state(manager[0], manager[1])
+                                    # print(pool.fetch_busy(manager[0]))
+                                    if state:
+                                        ui.checkbox(
+                                            value=pool.fetch_busy(manager[0]),
+                                            text=manager[1],
+                                            on_change=lambda e, m=manager[0]: set_busy_status(m, e.sender.value),
+                                        )
+
+        def update_states():
+            rows = []
+            for manager in managers.items():
+                state = pool.fetch_state(manager[0], manager[1])
+                if state:
+                    time = pool.fetch_last_checkout(manager[0])
+                    rows.append({"manager": manager[1], "state": state, "time": time})
+
+            current_state_table.rows = rows
+            current_state_table.add_slot(
+                "body-cell-state",
+                """
+                        <q-td key="state" :props="props">
+                            <q-badge :color="props.value == 'На рабочем месте' ? 'green' : 'red'">
+                                {{ props.value }}
+                            </q-badge>
+                        </q-td>
+                    """,
+            )
+            ui.update(current_state_table)
+
+        def update_outs(columns_all):
+            rows = []
+            for manager in managers.items():
+                outs = pool.fetch_check_outs(
+                    manager[0], month_select.value, year_select.value
+                )
+                if outs:
+                    rows.append({**{"manager": manager[1]}, **outs})
+            time_dash.columns = columns_all
+            time_dash.rows = rows
+            ui.update(time_dash)
+
+        def update_leaves(columns_all):
+            leaves_db = pool.fetch_leaves(month_select.value, year_select.value)
+            rows = []
+            for leave in leaves_db:
+                rows.append({"manager": leave[2], leave[0]: leave[1]})
+            leaves_table.columns = columns_all
+            merged_rows = {}
+
+            for row in rows:
+                manager = row["manager"]
+                if manager in merged_rows:
+                    merged_rows[manager].update(row)
+                else:
+                    merged_rows[manager] = row
+
+            rows = list(merged_rows.values())
+
+            leaves_table.rows = rows
+            ui.update(leaves_table)
+
+        def update_all():
+            columns_all = [
+                {
+                    "name": "manager",
+                    "label": "Сотрудник",
+                    "field": "manager",
+                    "required": True,
+                    "align": "left",
+                    "sortable": True,
+                }
+            ]
+            table_raw = pool.get_check_ins(
+                str(month_select.value).zfill(2), year_select.value
+            )
+            for key in table_raw.keys():
+                columns_all.append(
+                    {"name": key, "label": key, "field": key, "sortable": True}
+                )
+            update_checkins(table_raw, columns_all)
+            update_outs(columns_all)
+            update_states()
+            update_leaves(columns_all)
+
+        pool.fetch_leaves(month_select.value, year_select.value)
+        update_all()
+        ui.timer(5.0, update_states)
+        dashboard.bind_filter_from(manager_input, "value")
+        time_dash.bind_filter_from(manager_input, "value")
+        current_state_table.bind_filter_from(manager_input, "value")
+        leaves_table.bind_filter_from(manager_input, "value")
+    
+    def set_busy_status(mname, status: bool):
+        pool.insert_busy(mname, status)
+        print(f"Set {mname} to {status}")
+        update_states()
+
+    tux = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--!Font Awesome Free 6.5.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free Copyright 2024 Fonticons, Inc.--><path d="M220.8 123.3c1 .5 1.8 1.7 3 1.7 1.1 0 2.8-.4 2.9-1.5 .2-1.4-1.9-2.3-3.2-2.9-1.7-.7-3.9-1-5.5-.1-.4 .2-.8 .7-.6 1.1 .3 1.3 2.3 1.1 3.4 1.7zm-21.9 1.7c1.2 0 2-1.2 3-1.7 1.1-.6 3.1-.4 3.5-1.6 .2-.4-.2-.9-.6-1.1-1.6-.9-3.8-.6-5.5 .1-1.3 .6-3.4 1.5-3.2 2.9 .1 1 1.8 1.5 2.8 1.4zM420 403.8c-3.6-4-5.3-11.6-7.2-19.7-1.8-8.1-3.9-16.8-10.5-22.4-1.3-1.1-2.6-2.1-4-2.9-1.3-.8-2.7-1.5-4.1-2 9.2-27.3 5.6-54.5-3.7-79.1-11.4-30.1-31.3-56.4-46.5-74.4-17.1-21.5-33.7-41.9-33.4-72C311.1 85.4 315.7 .1 234.8 0 132.4-.2 158 103.4 156.9 135.2c-1.7 23.4-6.4 41.8-22.5 64.7-18.9 22.5-45.5 58.8-58.1 96.7-6 17.9-8.8 36.1-6.2 53.3-6.5 5.8-11.4 14.7-16.6 20.2-4.2 4.3-10.3 5.9-17 8.3s-14 6-18.5 14.5c-2.1 3.9-2.8 8.1-2.8 12.4 0 3.9 .6 7.9 1.2 11.8 1.2 8.1 2.5 15.7 .8 20.8-5.2 14.4-5.9 24.4-2.2 31.7 3.8 7.3 11.4 10.5 20.1 12.3 17.3 3.6 40.8 2.7 59.3 12.5 19.8 10.4 39.9 14.1 55.9 10.4 11.6-2.6 21.1-9.6 25.9-20.2 12.5-.1 26.3-5.4 48.3-6.6 14.9-1.2 33.6 5.3 55.1 4.1 .6 2.3 1.4 4.6 2.5 6.7v.1c8.3 16.7 23.8 24.3 40.3 23 16.6-1.3 34.1-11 48.3-27.9 13.6-16.4 36-23.2 50.9-32.2 7.4-4.5 13.4-10.1 13.9-18.3 .4-8.2-4.4-17.3-15.5-29.7zM223.7 87.3c9.8-22.2 34.2-21.8 44-.4 6.5 14.2 3.6 30.9-4.3 40.4-1.6-.8-5.9-2.6-12.6-4.9 1.1-1.2 3.1-2.7 3.9-4.6 4.8-11.8-.2-27-9.1-27.3-7.3-.5-13.9 10.8-11.8 23-4.1-2-9.4-3.5-13-4.4-1-6.9-.3-14.6 2.9-21.8zM183 75.8c10.1 0 20.8 14.2 19.1 33.5-3.5 1-7.1 2.5-10.2 4.6 1.2-8.9-3.3-20.1-9.6-19.6-8.4 .7-9.8 21.2-1.8 28.1 1 .8 1.9-.2-5.9 5.5-15.6-14.6-10.5-52.1 8.4-52.1zm-13.6 60.7c6.2-4.6 13.6-10 14.1-10.5 4.7-4.4 13.5-14.2 27.9-14.2 7.1 0 15.6 2.3 25.9 8.9 6.3 4.1 11.3 4.4 22.6 9.3 8.4 3.5 13.7 9.7 10.5 18.2-2.6 7.1-11 14.4-22.7 18.1-11.1 3.6-19.8 16-38.2 14.9-3.9-.2-7-1-9.6-2.1-8-3.5-12.2-10.4-20-15-8.6-4.8-13.2-10.4-14.7-15.3-1.4-4.9 0-9 4.2-12.3zm3.3 334c-2.7 35.1-43.9 34.4-75.3 18-29.9-15.8-68.6-6.5-76.5-21.9-2.4-4.7-2.4-12.7 2.6-26.4v-.2c2.4-7.6 .6-16-.6-23.9-1.2-7.8-1.8-15 .9-20 3.5-6.7 8.5-9.1 14.8-11.3 10.3-3.7 11.8-3.4 19.6-9.9 5.5-5.7 9.5-12.9 14.3-18 5.1-5.5 10-8.1 17.7-6.9 8.1 1.2 15.1 6.8 21.9 16l19.6 35.6c9.5 19.9 43.1 48.4 41 68.9zm-1.4-25.9c-4.1-6.6-9.6-13.6-14.4-19.6 7.1 0 14.2-2.2 16.7-8.9 2.3-6.2 0-14.9-7.4-24.9-13.5-18.2-38.3-32.5-38.3-32.5-13.5-8.4-21.1-18.7-24.6-29.9s-3-23.3-.3-35.2c5.2-22.9 18.6-45.2 27.2-59.2 2.3-1.7 .8 3.2-8.7 20.8-8.5 16.1-24.4 53.3-2.6 82.4 .6-20.7 5.5-41.8 13.8-61.5 12-27.4 37.3-74.9 39.3-112.7 1.1 .8 4.6 3.2 6.2 4.1 4.6 2.7 8.1 6.7 12.6 10.3 12.4 10 28.5 9.2 42.4 1.2 6.2-3.5 11.2-7.5 15.9-9 9.9-3.1 17.8-8.6 22.3-15 7.7 30.4 25.7 74.3 37.2 95.7 6.1 11.4 18.3 35.5 23.6 64.6 3.3-.1 7 .4 10.9 1.4 13.8-35.7-11.7-74.2-23.3-84.9-4.7-4.6-4.9-6.6-2.6-6.5 12.6 11.2 29.2 33.7 35.2 59 2.8 11.6 3.3 23.7 .4 35.7 16.4 6.8 35.9 17.9 30.7 34.8-2.2-.1-3.2 0-4.2 0 3.2-10.1-3.9-17.6-22.8-26.1-19.6-8.6-36-8.6-38.3 12.5-12.1 4.2-18.3 14.7-21.4 27.3-2.8 11.2-3.6 24.7-4.4 39.9-.5 7.7-3.6 18-6.8 29-32.1 22.9-76.7 32.9-114.3 7.2zm257.4-11.5c-.9 16.8-41.2 19.9-63.2 46.5-13.2 15.7-29.4 24.4-43.6 25.5s-26.5-4.8-33.7-19.3c-4.7-11.1-2.4-23.1 1.1-36.3 3.7-14.2 9.2-28.8 9.9-40.6 .8-15.2 1.7-28.5 4.2-38.7 2.6-10.3 6.6-17.2 13.7-21.1 .3-.2 .7-.3 1-.5 .8 13.2 7.3 26.6 18.8 29.5 12.6 3.3 30.7-7.5 38.4-16.3 9-.3 15.7-.9 22.6 5.1 9.9 8.5 7.1 30.3 17.1 41.6 10.6 11.6 14 19.5 13.7 24.6zM173.3 148.7c2 1.9 4.7 4.5 8 7.1 6.6 5.2 15.8 10.6 27.3 10.6 11.6 0 22.5-5.9 31.8-10.8 4.9-2.6 10.9-7 14.8-10.4s5.9-6.3 3.1-6.6-2.6 2.6-6 5.1c-4.4 3.2-9.7 7.4-13.9 9.8-7.4 4.2-19.5 10.2-29.9 10.2s-18.7-4.8-24.9-9.7c-3.1-2.5-5.7-5-7.7-6.9-1.5-1.4-1.9-4.6-4.3-4.9-1.4-.1-1.8 3.7 1.7 6.5z"/></svg>"""
+    if request.headers["user-agent"].lower().find("linux") != -1:
+        ui.html(tux).style("width: 5rem;height: 5rem; margin:2rem").classes(
+            "absolute-bottom-right animate-pulse hover:animate-spin"
+        ).tooltip("Спасибо, что пользуетесь GNU/Linux!")
+
+
+@app.post(
+    "/{token:str}/useradd",
+)
+async def add_new_user(user: User, token: str):
+    if token not in tokens:
+        return "No."
+
+    name = user.name
+    login = user.login
+    password = user.password
+    isAdmin = user.isAdmin
+    if password[-1]=="!":
+        return "Может перестанете ставить ! в конце пароля?????"
+    eng_name = get_table_name(name)
+    pool.add_manager(eng_name)
+    with open("userdata.txt", "a") as f:
+        f.write("%s!!!%s!!!%s!!!%s!!!%s\n" % (name, login, password, eng_name, isAdmin))
+    return "Ok"
+
+
+@app.post(
+    "/{token:str}/table.delete/{name:str}",
+)
+async def delete_table(name: str, token: str):
+    if token not in tokens:
+        return "No."
+    if name:
+        pool.drop_table(name)
+    return "Ok."
+
+
+@app.post("/{token:str}/rename")
+async def rename_user(old_name: str, new_name: str, token: str):
+    if token not in tokens:
+        return "No."
+    if old_name and new_name:
+        with open("userdata.txt", "r") as f:
+            lines = f.readlines()
+            for i, line in enumerate(lines):
+                if old_name in line:
+                    lines[i] = line.replace(old_name, new_name, 1).replace(
+                        get_table_name(old_name), get_table_name(new_name)
+                    )
+                    pool.rename_table(
+                        get_table_name(old_name), get_table_name(new_name)
+                    )
+                    break
+            with open("userdata.txt", "w") as fi:
+                fi.writelines(lines)
+    return "ok."
+
+
+@app.get("/{token:str}/fetch_state")
+async def fetch_state(token: str, name: str = Query(None)):
+    if token not in tokens:
+        return JSONResponse({"error": "Invalid token"}, status_code=403)
+    
+    if name:
+        english_name = get_table_name(name)
+        try:
+            result = pool.fetch_state(english_name, name)
+            return JSONResponse({"result": result})
+        except sqlite3.OperationalError:
+            return JSONResponse({"error": f"Manager {name} not found"}, status_code=404)
+    else:
+        return JSONResponse({"error": "Manager name not provided"}, status_code=400)
+
+
+@app.get("/{token:str}/fetch_busy")
+async def fetch_busy(token: str, name: str = Query(None)):
+    if token not in tokens:
+        return JSONResponse({"error": "Invalid token"}, status_code=403)
+    
+    if name:
+        # print(name)
+        try:
+            result = pool.fetch_busy(name)
+            return JSONResponse({"abracadabra": bool(int(result))})
+        except sqlite3.OperationalError:
+            return JSONResponse({"error": f"Manager {name} not found"}, status_code=404)
+    else:
+        return JSONResponse({"error": "Manager name not provided"}, status_code=400)
+
+
+@app.get("/{token:str}/fetch_start_time")
+async def fetch_start_time(token: str, name: str = Query(None)):
+    if token not in tokens:
+        return JSONResponse({"error": "Invalid token"}, status_code=403)
+    
+    if name:
+        english_name = get_table_name(name)
+        try:
+            result = pool.fetch_start_time(english_name)
+            return JSONResponse({"result": result})
+        except sqlite3.OperationalError:
+            return JSONResponse({"error": f"Manager {name} not found"}, status_code=404)
+    else:
+        return JSONResponse({"error": "Manager name not provided"}, status_code=400)
+
+
+@app.get("/{token:str}/fetch_leaves_timestamp")
+async def fetch_leaves_timestamp(token: str, name: str = Query(None)):
+    if token not in tokens:
+        return JSONResponse({"error": "Invalid token"}, status_code=403)
+    
+    if name:
+        # print(name)
+        try:
+            result = pool.fetch_leaves_timestamp(name)
+            return JSONResponse({"result": result})
+        except sqlite3.OperationalError:
+            return JSONResponse({"error": f"Manager {name} not found"}, status_code=404)
+    else:
+        return JSONResponse({"error": "Manager name not provided"}, status_code=400)    
+
+
+
+        
+ui.run(
+    port=4200,
+    storage_secret="8dbE81D*@rb8",
+    title="AIVA[Chronos]",
+    favicon="sandglass.png",
+    reconnect_timeout=10.0,
+    reload=False,
+)

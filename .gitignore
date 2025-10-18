@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# NiceGUI cache
+.nicegui/
+
+# Temporary files
+*.tmp
+*.temp
+apromstal-products-parser/
